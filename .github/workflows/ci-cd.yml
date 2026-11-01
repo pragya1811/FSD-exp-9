@@ -1,0 +1,124 @@
+name: CI and canary deployment
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run test:unit
+      - run: npm run test:contract
+      - run: npm run test:integration
+      - run: npm run build
+
+  publish:
+    name: Build and publish containers
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: type=sha,format=short
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.api
+          push: true
+          tags: ghcr.io/${{ github.repository }}-api:${{ steps.meta.outputs.version }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.web
+          push: true
+          tags: ghcr.io/${{ github.repository }}-web:${{ steps.meta.outputs.version }}
+
+  canary:
+    name: Canary deploy and promote
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Configure cluster access
+        shell: bash
+        env:
+          KUBECONFIG_BASE64: ${{ secrets.KUBECONFIG_BASE64 }}
+        run: |
+          test -n "$KUBECONFIG_BASE64" || { echo "Missing KUBECONFIG_BASE64 secret"; exit 1; }
+          mkdir -p "$HOME/.kube"
+          echo "$KUBECONFIG_BASE64" | base64 --decode > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Apply baseline
+        env:
+          API_IMAGE: ghcr.io/${{ github.repository }}-api:${{ needs.publish.outputs.image-tag }}
+          WEB_IMAGE: ghcr.io/${{ github.repository }}-web:${{ needs.publish.outputs.image-tag }}
+        run: |
+          STABLE_IMAGE="$(kubectl get deployment pipeline-api-stable -n pipeline-lab -o jsonpath='{.spec.template.spec.containers[?(@.name=="api")].image}' 2>/dev/null || true)"
+          if [ -z "$STABLE_IMAGE" ]; then STABLE_IMAGE="$API_IMAGE"; fi
+          sed \
+            -e "s|ghcr.io/replace-owner/replace-repo-api:latest|$STABLE_IMAGE|g" \
+            -e "s|ghcr.io/replace-owner/replace-repo-web:latest|$WEB_IMAGE|g" \
+            k8s/app.yaml | kubectl apply -f -
+      - name: Start canary replica
+        id: canary
+        env:
+          API_IMAGE: ghcr.io/${{ github.repository }}-api:${{ needs.publish.outputs.image-tag }}
+        run: |
+          kubectl apply -f k8s/canary.yaml
+          kubectl set image deployment/pipeline-api-canary api="$API_IMAGE" -n pipeline-lab
+          kubectl scale deployment/pipeline-api-canary --replicas=1 -n pipeline-lab
+          kubectl rollout status deployment/pipeline-api-canary -n pipeline-lab --timeout=180s
+          kubectl rollout status deployment/pipeline-web -n pipeline-lab --timeout=180s
+      - name: Clean up failed canary startup
+        if: failure() && steps.canary.outcome == 'failure'
+        run: kubectl scale deployment/pipeline-api-canary --replicas=0 -n pipeline-lab || true
+      - name: Verify canary health
+        id: canary-health
+        run: |
+          kubectl exec deployment/pipeline-api-canary -n pipeline-lab -- \
+            node -e "fetch('http://127.0.0.1:3000/api/health').then(async r=>{if(!r.ok)process.exit(1);const b=await r.json();if(b.status!=='ok')process.exit(1)}).catch(()=>process.exit(1))"
+      - name: Promote stable and remove canary
+        run: |
+          kubectl set image deployment/pipeline-api-stable api="ghcr.io/${{ github.repository }}-api:${{ needs.publish.outputs.image-tag }}" -n pipeline-lab
+          kubectl rollout status deployment/pipeline-api-stable -n pipeline-lab --timeout=180s
+          kubectl scale deployment/pipeline-api-canary --replicas=0 -n pipeline-lab
+      - name: Roll back failed canary
+        if: failure() && steps.canary-health.outcome == 'failure'
+        run: kubectl scale deployment/pipeline-api-canary --replicas=0 -n pipeline-lab || true

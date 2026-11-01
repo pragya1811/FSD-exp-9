@@ -1,0 +1,36 @@
+{
+  "name": "exp-9",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:api": "node --watch backend/server.js",
+    "build": "vite build",
+    "start:api": "node backend/server.js",
+    "lint": "oxlint",
+    "test": "vitest run",
+    "test:unit": "vitest run backend/run-service.test.js backend/app.test.js",
+    "test:integration": "vitest run backend/api.integration.test.js",
+    "test:contract": "vitest run src/api.contract.test.js",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "kafkajs": "^2.2.4",
+    "pg": "^8.16.3",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@testcontainers/kafka": "^12.2.1",
+    "@testcontainers/postgresql": "^12.2.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "oxlint": "^1.89.0",
+    "supertest": "^7.1.4",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
+  }
+}
